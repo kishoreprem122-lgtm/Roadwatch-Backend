@@ -1,15 +1,13 @@
 
 const express = require("express");
 const cors = require("cors");
-const mongoose = require("mongoose");
+const { Pool } = require("pg");
 const dotenv = require("dotenv");
 const multer = require("multer");
 const path = require("path");
 const fs = require("fs");
 const jwt = require("jsonwebtoken");
-
-const User = require("./models/User");
-const Report = require("./models/Report");
+const bcrypt = require("bcryptjs");
 
 dotenv.config();
 
@@ -28,13 +26,46 @@ app.use(
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+// NEON POSTGRESQL CONNECTION
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+});
+
+// CREATE TABLES IF THEY DON'T EXIST
+async function createTables() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+      name VARCHAR(255) NOT NULL,
+      email VARCHAR(255) UNIQUE NOT NULL,
+      password VARCHAR(255) NOT NULL,
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS reports (
+      id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+      damage_type VARCHAR(255) NOT NULL,
+      latitude DECIMAL(11, 8) NOT NULL,
+      longitude DECIMAL(11, 8) NOT NULL,
+      image_path VARCHAR(500) DEFAULT '',
+      status VARCHAR(50) DEFAULT 'Reported',
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+
+  console.log("Database tables ready.");
+}
+
 // CREATE UPLOADS FOLDER
 const uploadsDirectory = path.join(__dirname, "uploads");
-
 if (!fs.existsSync(uploadsDirectory)) {
   fs.mkdirSync(uploadsDirectory, { recursive: true });
 }
-
 app.use("/uploads", express.static(uploadsDirectory));
 
 // IMAGE UPLOAD CONFIGURATION
@@ -60,43 +91,6 @@ const upload = multer({
   },
 });
 
-// MONGODB CONNECTION MONITORING
-mongoose.connection.on("connected", () => {
-  console.log("MongoDB connection established.");
-});
-
-mongoose.connection.on("disconnected", () => {
-  console.log("WARNING: MongoDB disconnected!");
-});
-
-mongoose.connection.on("error", (error) => {
-  console.error("MongoDB connection error:", error.message);
-});
-
-// CONNECT TO MONGODB
-async function startServer() {
-  if (!process.env.MONGO_URI) {
-    console.error("MONGO_URI is missing from backend/.env");
-    process.exit(1);
-  }
-
-  try {
-    await mongoose.connect(process.env.MONGO_URI, {
-      serverSelectionTimeoutMS: 10000,
-    });
-
-    console.log("MongoDB connected successfully!");
-    console.log("MongoDB connection state:", mongoose.connection.readyState);
-
-    app.listen(PORT, () => {
-      console.log(`RoadWatch AI Backend running on http://localhost:${PORT}`);
-    });
-  } catch (error) {
-    console.error("MongoDB connection failed:", error.message);
-    process.exit(1);
-  }
-}
-
 // HOME ROUTE
 app.get("/", (req, res) => {
   res.send("RoadWatch AI Backend is running!");
@@ -121,30 +115,29 @@ app.post("/api/auth/register", async (req, res) => {
       });
     }
 
-    if (mongoose.connection.readyState !== 1) {
-      return res.status(503).json({
-        success: false,
-        message: "Database is not connected.",
-      });
-    }
-
     const normalizedEmail = email.trim().toLowerCase();
-    const existingUser = await User.findOne({ email: normalizedEmail });
 
-    if (existingUser) {
+    // Check if user exists
+    const existing = await pool.query(
+      "SELECT id FROM users WHERE email = $1",
+      [normalizedEmail]
+    );
+
+    if (existing.rows.length > 0) {
       return res.status(409).json({
         success: false,
         message: "An account with this email already exists.",
       });
     }
 
-    const user = await User.create({
-      name: name.trim(),
-      email: normalizedEmail,
-      password,
-    });
+    const hashedPassword = await bcrypt.hash(password, 12);
 
-    console.log("User registered:", user.email);
+    await pool.query(
+      "INSERT INTO users (name, email, password) VALUES ($1, $2, $3)",
+      [name.trim(), normalizedEmail, hashedPassword]
+    );
+
+    console.log("User registered:", normalizedEmail);
 
     return res.status(201).json({
       success: true,
@@ -152,13 +145,9 @@ app.post("/api/auth/register", async (req, res) => {
     });
   } catch (error) {
     console.error("REGISTRATION ERROR:", error);
-
-    return res.status(error.code === 11000 ? 409 : 500).json({
+    return res.status(500).json({
       success: false,
-      message:
-        error.code === 11000
-          ? "An account with this email already exists."
-          : "Registration failed.",
+      message: "Registration failed.",
       error: error.message,
     });
   }
@@ -176,13 +165,6 @@ app.post("/api/auth/login", async (req, res) => {
       });
     }
 
-    if (mongoose.connection.readyState !== 1) {
-      return res.status(503).json({
-        success: false,
-        message: "Database is not connected.",
-      });
-    }
-
     if (!process.env.JWT_SECRET) {
       return res.status(500).json({
         success: false,
@@ -190,18 +172,21 @@ app.post("/api/auth/login", async (req, res) => {
       });
     }
 
-    const user = await User.findOne({
-      email: email.trim().toLowerCase(),
-    });
+    const result = await pool.query(
+      "SELECT * FROM users WHERE email = $1",
+      [email.trim().toLowerCase()]
+    );
 
-    if (!user || typeof user.comparePassword !== "function") {
+    const user = result.rows[0];
+
+    if (!user) {
       return res.status(401).json({
         success: false,
         message: "Invalid email or password.",
       });
     }
 
-    const passwordMatches = await user.comparePassword(password);
+    const passwordMatches = await bcrypt.compare(password, user.password);
 
     if (!passwordMatches) {
       return res.status(401).json({
@@ -211,7 +196,7 @@ app.post("/api/auth/login", async (req, res) => {
     }
 
     const token = jwt.sign(
-      { id: user._id.toString() },
+      { id: user.id },
       process.env.JWT_SECRET,
       { expiresIn: "1d" }
     );
@@ -221,14 +206,13 @@ app.post("/api/auth/login", async (req, res) => {
       message: "Login successful!",
       token,
       user: {
-        id: user._id,
+        id: user.id,
         name: user.name,
         email: user.email,
       },
     });
   } catch (error) {
     console.error("LOGIN ERROR:", error);
-
     return res.status(500).json({
       success: false,
       message: "Login failed.",
@@ -244,7 +228,6 @@ app.post("/api/reports", (req, res) => {
   upload.single("image")(req, res, async (uploadError) => {
     if (uploadError) {
       console.error("IMAGE UPLOAD ERROR:", uploadError.message);
-
       return res.status(400).json({
         success: false,
         message: uploadError.message || "Image upload failed.",
@@ -252,18 +235,6 @@ app.post("/api/reports", (req, res) => {
     }
 
     try {
-      console.log("REPORT DATA:", req.body);
-      console.log("IMAGE RECEIVED:", Boolean(req.file));
-      console.log("MONGODB STATE:", mongoose.connection.readyState);
-
-      if (mongoose.connection.readyState !== 1) {
-        return res.status(503).json({
-          success: false,
-          message: "Database is not connected.",
-          connectionState: mongoose.connection.readyState,
-        });
-      }
-
       const { damageType, latitude, longitude } = req.body || {};
 
       if (
@@ -281,30 +252,32 @@ app.post("/api/reports", (req, res) => {
         });
       }
 
-      const reportData = {
-        damageType: String(damageType).trim(),
-        latitude: Number(latitude),
-        longitude: Number(longitude),
-        imagePath: req.file ? `/uploads/${req.file.filename}` : "",
-        status: "Reported",
-      };
+      const imagePath = req.file ? `/uploads/${req.file.filename}` : "";
 
-      console.log("DATA TO SAVE:", reportData);
+      const result = await pool.query(
+        `INSERT INTO reports (damage_type, latitude, longitude, image_path, status)
+         VALUES ($1, $2, $3, $4, 'Reported') RETURNING *`,
+        [String(damageType).trim(), Number(latitude), Number(longitude), imagePath]
+      );
 
-      const report = await Report.create(reportData);
-
-      console.log("REPORT SAVED SUCCESSFULLY:", report._id);
+      const report = result.rows[0];
+      console.log("REPORT SAVED SUCCESSFULLY:", report.id);
 
       return res.status(201).json({
         success: true,
         message: "Road damage report submitted successfully!",
-        report,
+        report: {
+          _id: report.id,
+          damageType: report.damage_type,
+          latitude: report.latitude,
+          longitude: report.longitude,
+          imagePath: report.image_path,
+          status: report.status,
+          createdAt: report.created_at,
+        },
       });
     } catch (error) {
       console.error("REPORT SUBMISSION ERROR:", error);
-      console.error("ERROR NAME:", error.name);
-      console.error("ERROR MESSAGE:", error.message);
-
       return res.status(500).json({
         success: false,
         message: "Failed to save road damage report.",
@@ -317,14 +290,19 @@ app.post("/api/reports", (req, res) => {
 // GET ALL REPORTS
 app.get("/api/reports", async (req, res) => {
   try {
-    if (mongoose.connection.readyState !== 1) {
-      return res.status(503).json({
-        success: false,
-        message: "Database is not connected.",
-      });
-    }
+    const result = await pool.query(
+      "SELECT * FROM reports ORDER BY created_at DESC"
+    );
 
-    const reports = await Report.find().sort({ createdAt: -1 });
+    const reports = result.rows.map((r) => ({
+      _id: r.id,
+      damageType: r.damage_type,
+      latitude: r.latitude,
+      longitude: r.longitude,
+      imagePath: r.image_path,
+      status: r.status,
+      createdAt: r.created_at,
+    }));
 
     return res.status(200).json({
       success: true,
@@ -333,7 +311,6 @@ app.get("/api/reports", async (req, res) => {
     });
   } catch (error) {
     console.error("FETCH REPORTS ERROR:", error);
-
     return res.status(500).json({
       success: false,
       message: "Failed to fetch reports.",
@@ -355,13 +332,6 @@ app.patch("/api/reports/:id", async (req, res) => {
       "Rejected",
     ];
 
-    if (!mongoose.isValidObjectId(req.params.id)) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid report ID.",
-      });
-    }
-
     if (!allowedStatuses.includes(status)) {
       return res.status(400).json({
         success: false,
@@ -369,27 +339,36 @@ app.patch("/api/reports/:id", async (req, res) => {
       });
     }
 
-    const report = await Report.findByIdAndUpdate(
-      req.params.id,
-      { status },
-      { new: true, runValidators: true }
+    const result = await pool.query(
+      `UPDATE reports SET status = $1, updated_at = NOW()
+       WHERE id = $2 RETURNING *`,
+      [status, req.params.id]
     );
 
-    if (!report) {
+    if (result.rows.length === 0) {
       return res.status(404).json({
         success: false,
         message: "Report not found.",
       });
     }
 
+    const r = result.rows[0];
+
     return res.status(200).json({
       success: true,
       message: "Report status updated successfully!",
-      report,
+      report: {
+        _id: r.id,
+        damageType: r.damage_type,
+        latitude: r.latitude,
+        longitude: r.longitude,
+        imagePath: r.image_path,
+        status: r.status,
+        createdAt: r.created_at,
+      },
     });
   } catch (error) {
     console.error("UPDATE REPORT ERROR:", error);
-
     return res.status(500).json({
       success: false,
       message: "Failed to update report.",
@@ -401,16 +380,32 @@ app.patch("/api/reports/:id", async (req, res) => {
 // GENERAL ERROR HANDLER
 app.use((error, req, res, next) => {
   console.error("SERVER ERROR:", error);
-
-  if (res.headersSent) {
-    return next(error);
-  }
-
+  if (res.headersSent) return next(error);
   return res.status(500).json({
     success: false,
     message: "An unexpected server error occurred.",
   });
 });
 
-// START AFTER DATABASE CONNECTS
+// START SERVER
+async function startServer() {
+  if (!process.env.DATABASE_URL) {
+    console.error("DATABASE_URL is missing from backend/.env");
+    process.exit(1);
+  }
+
+  try {
+    await pool.connect();
+    console.log("Connected to Neon PostgreSQL!");
+    await createTables();
+
+    app.listen(PORT, () => {
+      console.log(`RoadWatch AI Backend running on http://localhost:${PORT}`);
+    });
+  } catch (error) {
+    console.error("Database connection failed:", error.message);
+    process.exit(1);
+  }
+}
+
 startServer();
